@@ -8,9 +8,12 @@ from langchain_community.vectorstores import FAISS
 
 
 def load_vectorstore(path: str = "vectorstore") -> FAISS:
-    """Load a local FAISS vectorstore created by `ingest.py`."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    store = FAISS.load_local(path, embeddings)
+    store = FAISS.load_local(
+        path,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
     return store
 
 
