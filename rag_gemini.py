@@ -3,11 +3,20 @@ import json
 import requests
 from typing import List
 
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
+
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
 
 def load_vectorstore(path: str = "vectorstore") -> FAISS:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = path if os.path.isabs(path) else os.path.join(base_dir, path)
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     store = FAISS.load_local(
         path,
@@ -30,34 +39,72 @@ def build_prompt(docs: List[str], query: str) -> str:
 
 def call_gemini_via_rest(prompt: str, model: str = None, api_key: str = None) -> str:
     """
-    Call Google Generative Language REST endpoint (works with PaLM / Gen AI models).
+    Call Google Generative Language REST endpoint (Gemini).
 
-    This function uses the public REST endpoint and an API key. Set the environment
-    variable `GEMINI_API_KEY` to your API key and optionally `GEMINI_MODEL` to the
-    model name (default: text-bison-001). If you have a different Gemini/Vertex
-    setup, replace this function with your project's client code.
+    This function uses the public REST endpoint and an API key.
+
+    Required env var:
+      - GEMINI_API_KEY
+
+    Optional env vars:
+      - GEMINI_MODEL (default: gemini-1.5-flash)
+      - GEMINI_API_VERSION (default: v1beta)
     """
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
-    model = model or os.environ.get("GEMINI_MODEL", "text-bison-001")
+    model = model or os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    api_version = os.environ.get("GEMINI_API_VERSION", "v1beta")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is not set")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta2/models/{model}:generateText?key={api_key}"
+    # Modern Gemini API: :generateContent
+    url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent?key={api_key}"
     payload = {
-        "prompt": {"text": prompt},
-        "temperature": 0.2,
-        "maxOutputTokens": 512,
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 512,
+        },
     }
     headers = {"Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    # If the endpoint/model combo is wrong, try older :generateText once.
+    if resp.status_code == 404 or resp.status_code == 400:
+        legacy_model = os.environ.get("GEMINI_LEGACY_MODEL")
+        if legacy_model:
+            legacy_url = (
+                f"https://generativelanguage.googleapis.com/v1beta2/models/{legacy_model}:generateText"
+                f"?key={api_key}"
+            )
+            legacy_payload = {
+                "prompt": {"text": prompt},
+                "temperature": 0.2,
+                "maxOutputTokens": 512,
+            }
+            legacy_resp = requests.post(legacy_url, headers=headers, json=legacy_payload, timeout=60)
+            legacy_resp.raise_for_status()
+            legacy_data = legacy_resp.json()
+            candidates = legacy_data.get("candidates")
+            if candidates and isinstance(candidates, list):
+                return candidates[0].get("output", "") or ""
+            return legacy_data.get("output", "") or json.dumps(legacy_data)
+
     resp.raise_for_status()
     data = resp.json()
-    # Response usually has candidates list with output text
-    candidate = data.get("candidates")
-    if candidate and isinstance(candidate, list) and len(candidate) > 0:
-        return candidate[0].get("output", "")
+
+    # Expected shape:
+    # {"candidates": [{"content": {"parts": [{"text": "..."}]}}]}
+    candidates = data.get("candidates")
+    if candidates and isinstance(candidates, list):
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if parts and isinstance(parts, list):
+            text = parts[0].get("text")
+            if isinstance(text, str):
+                return text
+
     # Fallback for different response shapes
-    return data.get("output", "") or json.dumps(data)
+    return data.get("text", "") or data.get("output", "") or json.dumps(data)
 
 
 def answer_query(query: str, top_k: int = 4) -> str:
